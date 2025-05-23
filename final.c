@@ -3,8 +3,9 @@
 #include <string.h>
 #include <math.h>
 #include <float.h>
+#include <time.h>
 #include "Tokenize.h"
-#include<time.h>
+#include <stdbool.h>
 #include "timer.h"
 
 typedef struct {
@@ -21,33 +22,94 @@ typedef struct {
     char *token;
 } TokenEntry;
 
+// Improved KV cache structure
+typedef struct {
+    float *k_cache; // Shape: [num_layers, max_seq_len, d_model] - flattened
+    float *v_cache; // Shape: [num_layers, max_seq_len, d_model] - flattened
+    int max_seq_len;
+    int current_len;
+    int num_layers;
+    int d_model;
+} KVCache;
+
+// initialize KV cache
+KVCache* initialize_kv_cache(int max_seq_len, int num_layers, int d_model) {
+    KVCache *cache = malloc(sizeof(KVCache));
+    if (!cache) {
+        fprintf(stderr, "Memory allocation failed for KVCache\n");
+        exit(1);
+    }
+
+    cache->max_seq_len = max_seq_len;
+    cache->current_len = 0;
+    cache->num_layers = num_layers;
+    cache->d_model = d_model;
+    
+    // Allocate memory for K and V caches in one contiguous block per cache
+    size_t cache_size = (size_t)num_layers * max_seq_len * d_model * sizeof(float);
+    cache->k_cache = malloc(cache_size);
+    cache->v_cache = malloc(cache_size);
+    
+    if (!cache->k_cache || !cache->v_cache) {
+        fprintf(stderr, "Memory allocation failed for KV cache arrays\n");
+        if (cache->k_cache) free(cache->k_cache);
+        if (cache->v_cache) free(cache->v_cache);
+        free(cache);
+        exit(1);
+    }
+
+    // Initialize with zeros
+    memset(cache->k_cache, 0, cache_size);
+    memset(cache->v_cache, 0, cache_size);
+
+    return cache;
+}
+
+// function to free KV cache
+void free_kv_cache(KVCache *cache) {
+    if (!cache) return;
+    free(cache->k_cache);
+    free(cache->v_cache);
+    free(cache);
+}
+
+// function to get pointer to specific position in K cache
+float* get_k_cache_ptr(KVCache *cache, int layer_idx, int pos_idx) {
+    return &cache->k_cache[(layer_idx * cache->max_seq_len + pos_idx) * cache->d_model];
+}
+
+// function to get pointer to specific position in V cache
+float* get_v_cache_ptr(KVCache *cache, int layer_idx, int pos_idx) {
+    return &cache->v_cache[(layer_idx * cache->max_seq_len + pos_idx) * cache->d_model];
+}
+
+
+
 Tensor *load_gpt2_model(const char *filename, int *num_tensors_out) {
     FILE *f = fopen(filename, "rb");
     if (!f) { perror("fopen"); exit(1); }
-    
+
     Tensor *tensors = NULL;
     int num_tensors = 0;
     char line[256];
-    
     while (fgets(line, sizeof(line), f)) {
         Tensor t = {0};
         strncpy(t.name, line, sizeof(t.name)-1);
         size_t len = strlen(t.name);
         if (t.name[len-1] == '\n') t.name[len-1] = '\0';
-        
+
         if (!fgets(line, sizeof(line), f)) { fprintf(stderr, "Unexpected EOF\n"); exit(1); }
         sscanf(line, "%d %d %d %d %d", &t.ndim, &t.dims[0], &t.dims[1], &t.dims[2], &t.dims[3]);
-        
         t.size = 1;
         for (int i = 0; i < t.ndim; i++) t.size *= t.dims[i];
-        
+
         t.data = malloc(t.size * sizeof(float));
         fread(t.data, sizeof(float), t.size, f);
-        
+
         tensors = realloc(tensors, (num_tensors + 1) * sizeof(Tensor));
         tensors[num_tensors++] = t;
     }
-    
+
     fclose(f);
     *num_tensors_out = num_tensors;
     return tensors;
@@ -78,7 +140,7 @@ void layer_norm(float *input, float *output, float *gamma, float *beta, int N, i
             sum += input[n * d + i];
         }
         float mean = sum / d;
-        
+
         float sum_sq = 0.0f;
         for (int i = 0; i < d; i++) {
             float diff = input[n * d + i] - mean;
@@ -86,7 +148,7 @@ void layer_norm(float *input, float *output, float *gamma, float *beta, int N, i
         }
         float variance = sum_sq / d;
         float std = sqrtf(variance + epsilon);
-        
+
         for (int i = 0; i < d; i++) {
             output[n * d + i] = ((input[n * d + i] - mean) / std) * gamma[i] + beta[i];
         }
@@ -104,107 +166,196 @@ void matmul(float *A, float *B, float *C, int m, int n, int k) {
     }
 }
 
-void self_attention(float *input, float *output, float *c_attn_weight, float *c_attn_bias,
-                   float *c_proj_weight, float *c_proj_bias, int seq_len, int d_model,
-                   int num_heads, int d_k, float *Q, float *K, float *V) {
+// self-attention function to use KV cache
+void self_attention_with_cache(float *input, float *output,
+                             float *c_attn_weight, float *c_attn_bias,
+                             float *c_proj_weight, float *c_proj_bias,
+                             int seq_len, int d_model, int num_heads, int d_k,
+                             KVCache *cache, int layer_idx, bool use_cache,
+                             int position_id) {
+    // using the cache, we only need to compute for the new token
+    int process_len = use_cache ? 1 : seq_len;
+    int start_pos = use_cache ? seq_len - 1 : 0;
     
-    // Compute query, key, value projections
-    float *qkv = malloc(seq_len * 3 * d_model * sizeof(float));
-    float *attn_output = malloc(seq_len * d_model * sizeof(float));
-    
-    // QKV projection
-    matmul(input, c_attn_weight, qkv, seq_len, d_model, 3 * d_model);
-    for (int i = 0; i < seq_len; i++) {
+    // Compute QKV projections
+    float *qkv = malloc(process_len * 3 * d_model * sizeof(float));
+    if (!qkv) {
+        fprintf(stderr, "Memory allocation failed for QKV\n");
+        exit(1);
+    }
+
+    // QKV projection for current token(s)
+
+    // Note: c_attn_weight should be of shape [d_model, 3 * d_model]
+    // and it will be mulliplied with input of shape [process_len, d_model] 
+    // like qkv = input * c_attn_weight
+    matmul(&input[start_pos * d_model], c_attn_weight, qkv, process_len, d_model, 3 * d_model);
+    for (int i = 0; i < process_len; i++) {
         for (int j = 0; j < 3 * d_model; j++) {
             qkv[i * (3 * d_model) + j] += c_attn_bias[j];
         }
     }
-    
-    // Split QKV into separate arrays for ease of use
-    for (int i = 0; i < seq_len; i++) {
+
+    // Split QKV into separate arrays
+    // create Q, K, V arrays to store the split values
+    float *Q = malloc(process_len * d_model * sizeof(float));
+    float *K = malloc(process_len * d_model * sizeof(float));
+    float *V = malloc(process_len * d_model * sizeof(float));
+    if (!Q || !K || !V) {
+        fprintf(stderr, "Memory allocation failed for Q, K, V\n");
+        free(qkv);
+        if (Q) free(Q);
+        if (K) free(K);
+        if (V) free(V);
+        exit(1);
+    }
+    // Split QKV into Q, K, V
+    for (int i = 0; i < process_len; i++) {
         for (int j = 0; j < d_model; j++) {
             Q[i * d_model + j] = qkv[i * (3 * d_model) + j];
             K[i * d_model + j] = qkv[i * (3 * d_model) + d_model + j];
             V[i * d_model + j] = qkv[i * (3 * d_model) + 2 * d_model + j];
         }
     }
+
+    // Store K, V in cache
+    if (use_cache) {
+        // Store the current token's K, V values in the cache at position_id
+	printf("%d\n", d_model);
+        memcpy(get_k_cache_ptr(cache, layer_idx, position_id), K, d_model * sizeof(float));
+        memcpy(get_v_cache_ptr(cache, layer_idx, position_id), V, d_model * sizeof(float));
+        cache->current_len = position_id + 1;
+    } else {
+        // Populate cache with all tokens in initial pass
+        for (int pos = 0; pos < seq_len; pos++) {
+            memcpy(get_k_cache_ptr(cache, layer_idx, pos), &K[pos * d_model], d_model * sizeof(float));
+            memcpy(get_v_cache_ptr(cache, layer_idx, pos), &V[pos * d_model], d_model * sizeof(float));
+        }
+        cache->current_len = seq_len;
+    }
     
-    // Initialize output to zero
-    memset(attn_output, 0, seq_len * d_model * sizeof(float));
-    
+
+    // Output for attention result
+    float *attn_output = calloc(seq_len * d_model, sizeof(float));
+    if (!attn_output) {
+        fprintf(stderr, "Memory allocation failed for attention output\n");
+        free(qkv); free(Q); free(K); free(V);
+        exit(1);
+    }
+
     // Perform attention for each head
     for (int h = 0; h < num_heads; h++) {
         int offset = h * d_k;
         
-        // For each position in the sequence
-        for (int i = 0; i < seq_len; i++) {
-            // Compute attention scores
-            float *scores = malloc(seq_len * sizeof(float));
+        // Process each position in the sequence that we need to compute
+        for (int i = start_pos; i < seq_len; i++) {
+            // Calculate attention scores with all previous positions up to i
+            int context_len = use_cache ? cache->current_len : (i + 1);
+            float *scores = malloc(context_len * sizeof(float));
+            if (!scores) {
+                fprintf(stderr, "Memory allocation failed for scores\n");
+                free(qkv); free(Q); free(K); free(V); free(attn_output);
+                exit(1);
+            }
+
             float max_score = -FLT_MAX;
             
-            // Calculate raw attention scores (Q·K^T / sqrt(d_k))
-            for (int j = 0; j <= i; j++) {  // Causal mask: attend only to past
+            // Get current Q vector for this head
+            float *q_ptr = &Q[(i - start_pos) * d_model + offset];
+            
+            // Calculate attention scores with all context tokens
+            for (int j = 0; j < context_len; j++) {
                 scores[j] = 0.0f;
-                for (int k = 0; k < d_k; k++) {
-                    scores[j] += Q[i * d_model + offset + k] * K[j * d_model + offset + k];
-                }
-                scores[j] /= sqrtf((float)d_k);  // Scale by sqrt(d_k)
+                float *k_ptr;
                 
+                // Use cached K values
+                if (use_cache) {
+                    k_ptr = get_k_cache_ptr(cache, layer_idx, j) + offset;
+                } else {
+                    // For initial pass, use computed K values
+                    k_ptr = &K[j * d_model + offset];
+                }
+                
+                // Compute dot product
+                for (int k = 0; k < d_k; k++) {
+                    scores[j] += q_ptr[k] * k_ptr[k];
+                }
+                
+                // Scale by sqrt(d_k)
+                scores[j] /= sqrtf((float)d_k);
                 if (scores[j] > max_score) {
                     max_score = scores[j];
                 }
             }
-            
-            // Apply causal mask: set scores for future positions to -inf
-            for (int j = i+1; j < seq_len; j++) {
-                scores[j] = -FLT_MAX;
-            }
-            
+
             // Softmax: Convert scores to probabilities
             float sum_exp = 0.0f;
-            for (int j = 0; j < seq_len; j++) {
-                if (scores[j] == -FLT_MAX) {
-                    scores[j] = 0.0f;  // exp(-inf) = 0
-                } else {
-                    scores[j] = expf(scores[j] - max_score);  // Subtract max for numerical stability
-                    sum_exp += scores[j];
-                }
+            for (int j = 0; j < context_len; j++) {
+                scores[j] = expf(scores[j] - max_score); // Subtract max for numerical stability
+                sum_exp += scores[j];
             }
             
             // Normalize
-            if (sum_exp > 0.0f) {
-                for (int j = 0; j < seq_len; j++) {
-                    scores[j] /= sum_exp;
-                }
+            for (int j = 0; j < context_len; j++) {
+                scores[j] /= sum_exp;
             }
-            
+
             // Apply attention weights to values
             for (int k = 0; k < d_k; k++) {
                 float weighted_sum = 0.0f;
-                for (int j = 0; j < seq_len; j++) {
-                    weighted_sum += scores[j] * V[j * d_model + offset + k];
+                for (int j = 0; j < context_len; j++) {
+                    float v_value;
+                    // Use cached V values
+                    if (use_cache) {
+                        v_value = get_v_cache_ptr(cache, layer_idx, j)[offset + k];
+                    } else {
+                        // For initial pass, use computed V values
+                        v_value = V[j * d_model + offset + k];
+                    }
+                    weighted_sum += scores[j] * v_value;
                 }
                 attn_output[i * d_model + offset + k] = weighted_sum;
             }
+            
             free(scores);
         }
     }
-    
+
     // Final projection
-    matmul(attn_output, c_proj_weight, output, seq_len, d_model, d_model);
-    for (int i = 0; i < seq_len; i++) {
+    float *proj_output = malloc(seq_len * d_model * sizeof(float));
+    if (!proj_output) {
+        fprintf(stderr, "Memory allocation failed for proj output\n");
+        free(qkv); free(Q); free(K); free(V); free(attn_output);
+        exit(1);
+    }
+
+    // If using cache, only compute projection for the new token
+    if (use_cache) {
+        matmul(&attn_output[(seq_len-1) * d_model], c_proj_weight, &proj_output[(seq_len-1) * d_model], 1, d_model, d_model);
         for (int j = 0; j < d_model; j++) {
-            output[i * d_model + j] += c_proj_bias[j];
+            output[(seq_len-1) * d_model + j] = proj_output[(seq_len-1) * d_model + j] + c_proj_bias[j];
+        }
+    } else {
+        matmul(attn_output, c_proj_weight, proj_output, seq_len, d_model, d_model);
+        for (int i = 0; i < seq_len; i++) {
+            for (int j = 0; j < d_model; j++) {
+                output[i * d_model + j] = proj_output[i * d_model + j] + c_proj_bias[j];
+            }
         }
     }
-    
+
+    // Clean up
     free(qkv);
+    free(Q);
+    free(K);
+    free(V);
     free(attn_output);
+    free(proj_output);
 }
+
 void gelu(float *input, float *output, int size) {
     const float sqrt_2_pi = 0.7978845608;
     const float c = 0.044715;
-    
     for (int i = 0; i < size; i++) {
         float x = input[i];
         float x3 = x * x * x;
@@ -213,11 +364,49 @@ void gelu(float *input, float *output, int size) {
     }
 }
 
-void feed_forward(float *input, float *output, float *c_fc_weight, float *c_fc_bias,
-                 float *c_proj_weight, float *c_proj_bias, int seq_len, int d_model, int d_ff) {
+// Feed forward for single token (optimization for cached inference)
+void feed_forward_single_token(float *input, float *output, 
+                            float *c_fc_weight, float *c_fc_bias,
+                            float *c_proj_weight, float *c_proj_bias, 
+                            int d_model, int d_ff) {
+    // Process single token through feed-forward network
+    float *fc_output = malloc(d_ff * sizeof(float));
+    float *gelu_output = malloc(d_ff * sizeof(float));
     
+    if (!fc_output || !gelu_output) {
+        fprintf(stderr, "Memory allocation failed for feed-forward\n");
+        exit(1);
+    }
+    
+    // FC layer
+    matmul(input, c_fc_weight, fc_output, 1, d_model, d_ff);
+    for (int j = 0; j < d_ff; j++) {
+        fc_output[j] += c_fc_bias[j];
+    }
+    
+    // GELU activation
+    gelu(fc_output, gelu_output, d_ff);
+    
+    // Projection
+    matmul(gelu_output, c_proj_weight, output, 1, d_ff, d_model);
+    for (int j = 0; j < d_model; j++) {
+        output[j] += c_proj_bias[j];
+    }
+    
+    free(fc_output);
+    free(gelu_output);
+}
+
+// Standard feed-forward function for full sequence
+void feed_forward(float *input, float *output, float *c_fc_weight, float *c_fc_bias,
+                float *c_proj_weight, float *c_proj_bias, int seq_len, int d_model, int d_ff) {
     float *fc_output = malloc(seq_len * d_ff * sizeof(float));
     float *gelu_output = malloc(seq_len * d_ff * sizeof(float));
+    
+    if (!fc_output || !gelu_output) {
+        fprintf(stderr, "Memory allocation failed for feed-forward\n");
+        exit(1);
+    }
     
     matmul(input, c_fc_weight, fc_output, seq_len, d_model, d_ff);
     for (int i = 0; i < seq_len; i++) {
@@ -239,8 +428,13 @@ void feed_forward(float *input, float *output, float *c_fc_weight, float *c_fc_b
     free(gelu_output);
 }
 
-void transformer_block(float *input, float *output, Tensor *tensors, int num_tensors,
-                      int layer_idx, int seq_len, int d_model, int num_heads, int d_k, int d_ff, float epsilon) {
+// Modified transformer block to use KV cache
+void transformer_block_with_cache(float *input, float *output, 
+                               Tensor *tensors, int num_tensors,
+                               int layer_idx, int seq_len, int d_model, 
+                               int num_heads, int d_k, int d_ff, float epsilon,
+                               KVCache *cache, bool use_cache,
+                               int position_id) {
     
     char ln_1_weight_name[64], ln_1_bias_name[64];
     char ln_2_weight_name[64], ln_2_bias_name[64];
@@ -248,7 +442,7 @@ void transformer_block(float *input, float *output, Tensor *tensors, int num_ten
     char c_proj_weight_name[64], c_proj_bias_name[64];
     char c_fc_weight_name[64], c_fc_bias_name[64];
     char c_proj_mlp_weight_name[64], c_proj_mlp_bias_name[64];
-    
+
     snprintf(ln_1_weight_name, sizeof(ln_1_weight_name), "h.%d.ln_1.weight", layer_idx);
     snprintf(ln_1_bias_name, sizeof(ln_1_bias_name), "h.%d.ln_1.bias", layer_idx);
     snprintf(ln_2_weight_name, sizeof(ln_2_weight_name), "h.%d.ln_2.weight", layer_idx);
@@ -261,7 +455,7 @@ void transformer_block(float *input, float *output, Tensor *tensors, int num_ten
     snprintf(c_fc_bias_name, sizeof(c_fc_bias_name), "h.%d.mlp.c_fc.bias", layer_idx);
     snprintf(c_proj_mlp_weight_name, sizeof(c_proj_mlp_weight_name), "h.%d.mlp.c_proj.weight", layer_idx);
     snprintf(c_proj_mlp_bias_name, sizeof(c_proj_mlp_bias_name), "h.%d.mlp.c_proj.bias", layer_idx);
-    
+
     Tensor *ln_1_weight = find_tensor_by_name(tensors, num_tensors, ln_1_weight_name);
     Tensor *ln_1_bias = find_tensor_by_name(tensors, num_tensors, ln_1_bias_name);
     Tensor *c_attn_weight = find_tensor_by_name(tensors, num_tensors, c_attn_weight_name);
@@ -274,7 +468,7 @@ void transformer_block(float *input, float *output, Tensor *tensors, int num_ten
     Tensor *c_proj_mlp_bias = find_tensor_by_name(tensors, num_tensors, c_proj_mlp_bias_name);
     Tensor *ln_2_weight = find_tensor_by_name(tensors, num_tensors, ln_2_weight_name);
     Tensor *ln_2_bias = find_tensor_by_name(tensors, num_tensors, ln_2_bias_name);
-    
+
     if (!ln_1_weight || !ln_1_bias || !c_attn_weight || !c_attn_bias ||
         !c_proj_weight || !c_proj_bias || !c_fc_weight || !c_fc_bias ||
         !c_proj_mlp_weight || !c_proj_mlp_bias || !ln_2_weight || !ln_2_bias) {
@@ -282,49 +476,124 @@ void transformer_block(float *input, float *output, Tensor *tensors, int num_ten
         exit(1);
     }
     
-    float *ln_1_output = malloc(seq_len * d_model * sizeof(float));
-    float *attn_output = malloc(seq_len * d_model * sizeof(float));
-    float *Q = malloc(seq_len * d_model * sizeof(float));
-    float *K = malloc(seq_len * d_model * sizeof(float));
-    float *V = malloc(seq_len * d_model * sizeof(float));
-    float *residual_1 = malloc(seq_len * d_model * sizeof(float));
-    float *ffn_output = malloc(seq_len * d_model * sizeof(float));
-    float *ln_2_output = malloc(seq_len * d_model * sizeof(float));
-    
-    // First LayerNorm
-    layer_norm(input, ln_1_output, ln_1_weight->data, ln_1_bias->data, seq_len, d_model, epsilon);
-    
-    // Self-Attention
-    self_attention(ln_1_output, attn_output, c_attn_weight->data, c_attn_bias->data,
-                  c_proj_weight->data, c_proj_bias->data, seq_len, d_model,
-                  num_heads, d_k, Q, K, V);
-    
-    // Residual connection: input + attn_output
-    for (int i = 0; i < seq_len * d_model; i++) {
-        residual_1[i] = input[i] + attn_output[i];
+    // Process differently depending on whether we're using cache
+    if (use_cache) {
+        // When using cache, we only need to process the new token
+        float *ln_1_output = malloc(d_model * sizeof(float));
+        float *attn_output = malloc(seq_len * d_model * sizeof(float));
+        float *residual_1 = malloc(d_model * sizeof(float));
+        float *ln_2_output = malloc(d_model * sizeof(float));
+        float *ffn_output = malloc(d_model * sizeof(float));
+        
+        if (!ln_1_output || !attn_output || !residual_1 || !ln_2_output || !ffn_output) {
+            fprintf(stderr, "Memory allocation failed in transformer_block\n");
+            exit(1);
+        }
+        
+        // Apply layer norm to current token only
+        layer_norm(&input[(seq_len-1) * d_model], ln_1_output, ln_1_weight->data, ln_1_bias->data, 1, d_model, epsilon);
+        
+        // Copy ln_1_output to full input for attention
+        float *attn_input = malloc(seq_len * d_model * sizeof(float));
+        if (!attn_input) {
+            fprintf(stderr, "Memory allocation failed for attn_input\n");
+            exit(1);
+        }
+        
+        // Copy previous tokens' data (not needed for attention computation but keep for output shape)
+        memcpy(attn_input, input, (seq_len-1) * d_model * sizeof(float));
+        // Copy current token's normalized data
+        memcpy(&attn_input[(seq_len-1) * d_model], ln_1_output, d_model * sizeof(float));
+        
+        // Self-attention with cache - process only the new token but attend to all previous tokens via cache
+        self_attention_with_cache(attn_input, attn_output, 
+                               c_attn_weight->data, c_attn_bias->data,
+                               c_proj_weight->data, c_proj_bias->data, 
+                               seq_len, d_model, num_heads, d_k,
+                               cache, layer_idx, use_cache, position_id);
+        
+        // Residual connection for current token only
+        for (int j = 0; j < d_model; j++) {
+            residual_1[j] = input[(seq_len-1) * d_model + j] + attn_output[(seq_len-1) * d_model + j];
+        }
+        
+        // Second layer norm for current token
+        layer_norm(residual_1, ln_2_output, ln_2_weight->data, ln_2_bias->data, 1, d_model, epsilon);
+        
+        // Feed-forward for current token only
+        feed_forward_single_token(ln_2_output, ffn_output, 
+                               c_fc_weight->data, c_fc_bias->data,
+                               c_proj_mlp_weight->data, c_proj_mlp_bias->data, 
+                               d_model, d_ff);
+        
+        // Final residual connection and copy to output
+        for (int j = 0; j < d_model; j++) {
+            output[(seq_len-1) * d_model + j] = residual_1[j] + ffn_output[j];
+        }
+        
+        // Copy previous tokens' output (unchanged when using cache)
+        if (seq_len > 1) {
+            memcpy(output, input, (seq_len-1) * d_model * sizeof(float));
+        }
+        
+        // Clean up
+        free(ln_1_output);
+        free(attn_input);
+        free(attn_output);
+        free(residual_1);
+        free(ln_2_output);
+        free(ffn_output);
+    } else {
+        // Standard processing for full sequence (initial pass)
+        float *ln_1_output = malloc(seq_len * d_model * sizeof(float));
+        float *attn_output = malloc(seq_len * d_model * sizeof(float));
+        float *residual_1 = malloc(seq_len * d_model * sizeof(float));
+        float *ln_2_output = malloc(seq_len * d_model * sizeof(float));
+        float *ffn_output = malloc(seq_len * d_model * sizeof(float));
+        
+        if (!ln_1_output || !attn_output || !residual_1 || !ln_2_output || !ffn_output) {
+            fprintf(stderr, "Memory allocation failed in transformer_block\n");
+            exit(1);
+        }
+        
+        // First LayerNorm
+        layer_norm(input, ln_1_output, ln_1_weight->data, ln_1_bias->data, seq_len, d_model, epsilon);
+        
+        // Self-Attention with cache population (but not using cached values yet)
+        self_attention_with_cache(ln_1_output, attn_output, 
+                               c_attn_weight->data, c_attn_bias->data,
+                               c_proj_weight->data, c_proj_bias->data, 
+                               seq_len, d_model, num_heads, d_k,
+                               cache, layer_idx, false, position_id);
+        
+        // Residual connection
+        for (int i = 0; i < seq_len * d_model; i++) {
+            residual_1[i] = input[i] + attn_output[i];
+        }
+        
+        // Second LayerNorm
+        layer_norm(residual_1, ln_2_output, ln_2_weight->data, ln_2_bias->data, seq_len, d_model, epsilon);
+        
+        // Feed-Forward
+        feed_forward(ln_2_output, ffn_output, 
+                   c_fc_weight->data, c_fc_bias->data,
+                   c_proj_mlp_weight->data, c_proj_mlp_bias->data, 
+                   seq_len, d_model, d_ff);
+        
+        // Final residual connection
+        for (int i = 0; i < seq_len * d_model; i++) {
+            output[i] = residual_1[i] + ffn_output[i];
+        }
+        
+        // Clean up
+        free(ln_1_output);
+        free(attn_output);
+        free(residual_1);
+        free(ln_2_output);
+        free(ffn_output);
     }
-    
-    // Second LayerNorm
-    layer_norm(residual_1, ln_2_output, ln_2_weight->data, ln_2_bias->data, seq_len, d_model, epsilon);
-    
-    // Feed-Forward
-    feed_forward(ln_2_output, ffn_output, c_fc_weight->data, c_fc_bias->data,
-                c_proj_mlp_weight->data, c_proj_mlp_bias->data, seq_len, d_model, d_ff);
-    
-    // Residual connection and output: residual_1 + ffn_output
-    for (int i = 0; i < seq_len * d_model; i++) {
-        output[i] = residual_1[i] + ffn_output[i];
-    }
-    
-    free(ln_1_output);
-    free(attn_output);
-    free(Q);
-    free(K);
-    free(V);
-    free(residual_1);
-    free(ffn_output);
-    free(ln_2_output);
 }
+
 // Function to find the token with the highest probability
 int argmax(float *array, int size) {
     int max_idx = 0;
@@ -345,14 +614,14 @@ void softmax(float *logits, float *probs, int size) {
     for (int i = 1; i < size; i++) {
         if (logits[i] > max_val) max_val = logits[i];
     }
-    
+
     // Compute exponentials and sum
     float sum_exp = 0.0f;
     for (int i = 0; i < size; i++) {
         probs[i] = expf(logits[i] - max_val);
         sum_exp += probs[i];
     }
-    
+
     // Normalize
     for (int i = 0; i < size; i++) {
         probs[i] /= sum_exp;
@@ -366,11 +635,10 @@ TokenEntry *load_token_mapping(const char *filename, int *num_tokens) {
         fprintf(stderr, "Failed to open token mapping file %s\n", filename);
         return NULL;
     }
-    
+
     int capacity = 1000;
     TokenEntry *tokens = malloc(capacity * sizeof(TokenEntry));
     *num_tokens = 0;
-    
     char line[1024];
     while (fgets(line, sizeof(line), f)) {
         int id;
@@ -385,7 +653,6 @@ TokenEntry *load_token_mapping(const char *filename, int *num_tokens) {
             (*num_tokens)++;
         }
     }
-    
     fclose(f);
     return tokens;
 }
@@ -397,37 +664,34 @@ const char *get_token_str(TokenEntry *tokens, int num_tokens, int token_id) {
             return tokens[i].token;
         }
     }
-    return "<unknown>";
+    return "";
 }
 
 void printclean(int *initial_tokens, int initial_len, TokenEntry *token_mapping, int num_token_entries) {
-	for (int i = 0; i < initial_len; i++) {
-		const char *token_str = get_token_str(token_mapping, num_token_entries, initial_tokens[i]);
-		// Process each character to replace Ġ/Ċ
-		for (int j = 0; token_str[j] != '\0'; ) {
-			if ((unsigned char)token_str[j] == 0xC4) {
-				if ((unsigned char)token_str[j+1] == 0xA0) {  // Ġ -> space
-					putchar(' ');
-					j += 2;
-				} else if ((unsigned char)token_str[j+1] == 0x8A) {  // Ċ -> newline
-					putchar('\n');
-					j += 2;
-				} else {
-					putchar(token_str[j]);
-					j++;
-				}
-			} else {
-				putchar(token_str[j]);
-				j++;
-			}
-		}
-	}
-        fflush(stdout);  // Ensure immediate output
+    for (int i = 0; i < initial_len; i++) {
+        const char *token_str = get_token_str(token_mapping, num_token_entries, initial_tokens[i]);
+        // Process each character to replace Ġ/Ċ
+        for (int j = 0; token_str[j] != '\0'; ) {
+            if ((unsigned char)token_str[j] == 0xC4) {
+                if ((unsigned char)token_str[j+1] == 0xA0) { // Ġ -> space
+                    putchar(' ');
+                    j += 2;
+                } else if ((unsigned char)token_str[j+1] == 0x8A) { // Ċ -> newline
+                    putchar('\n');
+                    j += 2;
+                } else {
+                    putchar(token_str[j]);
+                    j++;
+                }
+            } else {
+                putchar(token_str[j]);
+                j++;
+            }
+        }
+    }
+    fflush(stdout); // Ensure immediate output
 }
 
-
-// New function to generate text
-// Add these functions to your code for better text generation
 // Generate a random number between 0 and 1
 float random_uniform() {
     return (float)rand() / (float)RAND_MAX;
@@ -455,13 +719,10 @@ int sample_token(float *probs, int size) {
 // Top-k filtering: keep only the top k tokens with highest probability
 void top_k_filtering(float *logits, int size, int k) {
     if (k >= size || k <= 0) return; // No filtering needed
-    
     // Find the kth largest logit
     float *logits_copy = malloc(size * sizeof(float));
     memcpy(logits_copy, logits, size * sizeof(float));
-    
     // Simple selection algorithm to find kth value
-    // In production code, use a more efficient algorithm
     for (int i = 0; i < k; i++) {
         float max_val = -FLT_MAX;
         int max_idx = -1;
@@ -494,16 +755,13 @@ void top_k_filtering(float *logits, int size, int k) {
 // Top-p (nucleus) sampling: keep smallest set of tokens whose cumulative probability exceeds p
 void top_p_filtering(float *logits, float *probs, int size, float p) {
     if (p >= 1.0f || p <= 0.0f) return; // No filtering needed
-    
     // First compute probabilities
     softmax(logits, probs, size);
-    
     // Create index array
     typedef struct {
         int idx;
         float prob;
     } IdxProb;
-    
     IdxProb *items = malloc(size * sizeof(IdxProb));
     for (int i = 0; i < size; i++) {
         items[i].idx = i;
@@ -541,22 +799,20 @@ void top_p_filtering(float *logits, float *probs, int size, float p) {
     }
     
     free(items);
-    
     // Recompute probabilities
     softmax(logits, probs, size);
 }
 
-// Modify your generate_text function to use these sampling methods
-void generate_text(Tensor *tensors, int num_tensors, int *initial_tokens, int initial_len, 
-                  int max_new_tokens, TokenEntry *token_mapping, int num_token_entries) {
-    
+// Modified generate_text function to use KV cache
+void generate_text_with_cache(Tensor *tensors, int num_tensors, int *initial_tokens, int initial_len,
+                          int max_new_tokens, TokenEntry *token_mapping, int num_token_entries) {
     // Initialize random seed
     srand(time(NULL));
     
     // Hyperparameters for sampling
-    float temperature = 0.7f;  // Lower = more focused, higher = more random
-    int top_k = 40;            // Consider only top k tokens
-    float top_p = 0.9f;        // Consider tokens with cumulative probability < p
+    float temperature = 0.7f; // Lower = more focused, higher = more random
+    int top_k = 40;           // Consider only top k tokens
+    float top_p = 0.9f;       // Consider tokens with cumulative probability < p
     
     // Load model parameters
     Tensor *wte = find_tensor_by_name(tensors, num_tensors, "wte.weight");
@@ -565,8 +821,8 @@ void generate_text(Tensor *tensors, int num_tensors, int *initial_tokens, int in
     Tensor *ln_f_bias = find_tensor_by_name(tensors, num_tensors, "ln_f.bias");
     
     // Model parameters
-    int d_model = wte->dims[1]; 
-    int num_heads = 12; 
+    int d_model = wte->dims[1];
+    int num_heads = 12;
     int d_k = d_model / num_heads;
     int d_ff = 4 * d_model;
     int vocab_size = wte->dims[0];
@@ -595,15 +851,26 @@ void generate_text(Tensor *tensors, int num_tensors, int *initial_tokens, int in
     int max_seq_len = initial_len + max_new_tokens;
     int *token_sequence = malloc(max_seq_len * sizeof(int));
     memcpy(token_sequence, initial_tokens, initial_len * sizeof(int));
-    
     int current_seq_len = initial_len;
+    
+    // Initialize KV cache
+    KVCache *cache = initialize_kv_cache(max_seq_len, num_layers, d_model);
+    
     Timer timer;
     start_timer(&timer);
-    // Generate new tokens
-    for (int iter = 0; iter < max_new_tokens; iter++) {
-        // Compute embeddings
-        float *embeddings = malloc(current_seq_len * d_model * sizeof(float));
-        for (int i = 0; i < current_seq_len; i++) {
+    
+    // First pass: process the entire prompt (prefill phase)
+    {
+        int seq_len = initial_len;
+        
+        // Compute embeddings for the prompt
+        float *embeddings = malloc(seq_len * d_model * sizeof(float));
+        if (!embeddings) {
+            fprintf(stderr, "Memory allocation failed for embeddings\n");
+            exit(1);
+        }
+        
+        for (int i = 0; i < seq_len; i++) {
             for (int j = 0; j < d_model; j++) {
                 embeddings[i * d_model + j] = wte->data[token_sequence[i] * d_model + j] +
                                              wpe->data[i * d_model + j];
@@ -611,30 +878,90 @@ void generate_text(Tensor *tensors, int num_tensors, int *initial_tokens, int in
         }
         
         // Forward pass through all layers
-        float *layer_input = malloc(current_seq_len * d_model * sizeof(float));
-        float *layer_output = malloc(current_seq_len * d_model * sizeof(float));
+        float *layer_input = malloc(seq_len * d_model * sizeof(float));
+        float *layer_output = malloc(seq_len * d_model * sizeof(float));
+        if (!layer_input || !layer_output) {
+            fprintf(stderr, "Memory allocation failed for layer buffers\n");
+            exit(1);
+        }
         
         // Copy embeddings to layer_input
-        memcpy(layer_input, embeddings, current_seq_len * d_model * sizeof(float));
+        memcpy(layer_input, embeddings, seq_len * d_model * sizeof(float));
         
-        // Process each layer
+        // Process each layer, populating the KV cache
         for (int layer_idx = 0; layer_idx < num_layers; layer_idx++) {
-            transformer_block(layer_input, layer_output, tensors, num_tensors,
-                             layer_idx, current_seq_len, d_model, num_heads, d_k, d_ff, epsilon);
+            transformer_block_with_cache(layer_input, layer_output, tensors, num_tensors,
+                                      layer_idx, seq_len, d_model, num_heads, d_k, d_ff, epsilon,
+                                      cache, false, 0); // last parameter is position_id, starts at 0
+            
             // Swap input and output for next layer
             float *temp = layer_input;
             layer_input = layer_output;
             layer_output = temp;
         }
         
+        // The final output is now in layer_input due to the swap
+        
+        // Clean up
+        free(embeddings);
+        free(layer_input);
+        free(layer_output);
+    }
+    
+    // Now generate new tokens one by one using the cache
+    for (int iter = 0; iter < max_new_tokens; iter++) {
+        int seq_len = current_seq_len;
+        int position_id = seq_len - 1; // Current position for positional embedding
+        
+        // Compute embedding only for the new token
+        float *embedding = malloc(d_model * sizeof(float));
+        if (!embedding) {
+            fprintf(stderr, "Memory allocation failed for embedding\n");
+            exit(1);
+        }
+        
+        for (int j = 0; j < d_model; j++) {
+            embedding[j] = wte->data[token_sequence[position_id] * d_model + j] +
+                          wpe->data[position_id * d_model + j];
+        }
+        
+        // Create input with enough space for the full sequence
+        float *layer_input = malloc(seq_len * d_model * sizeof(float));
+        float *layer_output = malloc(seq_len * d_model * sizeof(float));
+        if (!layer_input || !layer_output) {
+            fprintf(stderr, "Memory allocation failed for layer buffers\n");
+            exit(1);
+        }
+        
+        // For cached inference, we only need the new token at the end
+        memcpy(&layer_input[(seq_len-1) * d_model], embedding, d_model * sizeof(float));
+        
+        // Process each layer
+        for (int layer_idx = 0; layer_idx < num_layers; layer_idx++) {
+            transformer_block_with_cache(layer_input, layer_output, tensors, num_tensors,
+                                      layer_idx, seq_len, d_model, num_heads, d_k, d_ff, epsilon,
+                                      cache, true, position_id);
+            
+            // Swap input and output for next layer
+            float *temp = layer_input;
+            layer_input = layer_output;
+            layer_output = temp;
+        }
+        
+        // The final output for the new token is now in layer_input due to the swap
+        
         // Compute logits for the last position only
         float *logits = malloc(vocab_size * sizeof(float));
         float *probs = malloc(vocab_size * sizeof(float));
         float *ln_output = malloc(d_model * sizeof(float));
+        if (!logits || !probs || !ln_output) {
+            fprintf(stderr, "Memory allocation failed for logits\n");
+            exit(1);
+        }
         
         // Apply layer norm
-        layer_norm(&layer_input[(current_seq_len-1) * d_model], ln_output, 
-                  ln_f_weight->data, ln_f_bias->data, 1, d_model, epsilon);
+        layer_norm(&layer_input[(seq_len-1) * d_model], ln_output,
+                   ln_f_weight->data, ln_f_bias->data, 1, d_model, epsilon);
         
         // Compute logits
         for (int i = 0; i < vocab_size; i++) {
@@ -662,29 +989,27 @@ void generate_text(Tensor *tensors, int num_tensors, int *initial_tokens, int in
         
         // Print the new token
         const char *token_str = get_token_str(token_mapping, num_token_entries, next_token);
-	// Print each character, replacing Ġ and Ċ with space and newline
-
-	for (int i = 0; token_str[i] != '\0'; ) {
-		// Check for Ġ (UTF-8: 0xC4 0xA0)
-		if ((unsigned char)token_str[i] == 0xC4 && (unsigned char)token_str[i+1] == 0xA0) {
-			putchar(' ');
-			i += 2;
-		}
-		// Check for Ċ (UTF-8: 0xC4 0x8A)
-		else if ((unsigned char)token_str[i] == 0xC4 && (unsigned char)token_str[i+1] == 0x8A) {
-			putchar('\n');
-			i += 2;
-		}
-		else {
-			putchar(token_str[i]);
-			i++;
-		}
-	}
-	fflush(stdout);
-
+        // Print each character, replacing Ġ and Ċ with space and newline
+        for (int i = 0; token_str[i] != '\0'; ) {
+            // Check for Ġ (UTF-8: 0xC4 0xA0)
+            if ((unsigned char)token_str[i] == 0xC4 && (unsigned char)token_str[i+1] == 0xA0) {
+                putchar(' ');
+                i += 2;
+            }
+            // Check for Ċ (UTF-8: 0xC4 0x8A)
+            else if ((unsigned char)token_str[i] == 0xC4 && (unsigned char)token_str[i+1] == 0x8A) {
+                putchar('\n');
+                i += 2;
+            }
+            else {
+                putchar(token_str[i]);
+                i++;
+            }
+        }
+        fflush(stdout);
         
         // Clean up for this iteration
-        free(embeddings);
+        free(embedding);
         free(layer_input);
         free(layer_output);
         free(logits);
@@ -696,19 +1021,23 @@ void generate_text(Tensor *tensors, int num_tensors, int *initial_tokens, int in
             break;
         }
     }
+    
     stop_timer(&timer);
-
+    
     // Calculate metrics
     double elapsed_sec = get_elapsed_sec(&timer);
     int new_tokens = current_seq_len - initial_len;
     double tokens_per_sec = new_tokens / elapsed_sec;
-
-    printf("\n\nGenerated %d tokens in %.2f seconds (%.2f tokens/sec)\n",
-		    new_tokens, elapsed_sec, tokens_per_sec);
     
+    printf("\n\nGenerated %d tokens in %.2f seconds (%.2f tokens/sec)\n",
+           new_tokens, elapsed_sec, tokens_per_sec);
     printf("\n\nGeneration complete.\n");
+    
+    // Clean up
     free(token_sequence);
+    free_kv_cache(cache);
 }
+
 int main(int argc, char **argv) {
     if (argc != 4) {
         fprintf(stderr, "Usage: %s pytorch_model.bin token_mapping.txt input_text\n", argv[0]);
@@ -741,20 +1070,22 @@ int main(int argc, char **argv) {
     
     printf("Input tokenized to %d tokens\n", seq_len);
     
-    // Generate 50 new tokens
-    generate_text(tensors, num_tensors, token_ids, seq_len, 10, token_mapping, num_token_entries);
+    // Generate 10 new tokens using cache
+    generate_text_with_cache(tensors, num_tensors, token_ids, seq_len, 10, token_mapping, num_token_entries);
     
     // Clean up
     free(token_ids);
     for (int i = 0; i < num_tensors; i++) {
         free(tensors[i].data);
     }
+    
     free(tensors);
     
     // Free token mapping
     for (int i = 0; i < num_token_entries; i++) {
         free(token_mapping[i].token);
     }
+    
     free(token_mapping);
     
     return 0;
