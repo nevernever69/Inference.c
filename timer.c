@@ -1,6 +1,6 @@
 // timer.c
 #include <time.h>
-#include "timer.h"
+#include "include/timer.h"
 
 void start_timer(Timer *t) {
     clock_gettime(CLOCK_MONOTONIC, &t->start);

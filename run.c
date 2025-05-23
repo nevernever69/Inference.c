@@ -4,9 +4,9 @@
 #include <math.h>
 #include <float.h>
 #include <time.h>
-#include "Tokenize.h"
 #include <stdbool.h>
-#include "timer.h"
+#include "include/Tokenize.h"
+#include "include/timer.h"
 
 typedef struct {
     char name[64];
@@ -221,7 +221,6 @@ void self_attention_with_cache(float *input, float *output,
     // Store K, V in cache
     if (use_cache) {
         // Store the current token's K, V values in the cache at position_id
-	printf("%d\n", d_model);
         memcpy(get_k_cache_ptr(cache, layer_idx, position_id), K, d_model * sizeof(float));
         memcpy(get_v_cache_ptr(cache, layer_idx, position_id), V, d_model * sizeof(float));
         cache->current_len = position_id + 1;
@@ -1039,14 +1038,15 @@ void generate_text_with_cache(Tensor *tensors, int num_tensors, int *initial_tok
 }
 
 int main(int argc, char **argv) {
-    if (argc != 4) {
-        fprintf(stderr, "Usage: %s pytorch_model.bin token_mapping.txt input_text\n", argv[0]);
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s input_text Max_Tokens\n", argv[0]);
         return 1;
     }
     
-    char *model_file = argv[1];
-    char *token_map_file = argv[2];
-    char *input = argv[3];
+    char *input = argv[1];
+    char max_tokens = atoi(argv[2]);
+    char *model_file = "Model/GPT2/model.bin";
+    char *token_map_file = "token_mapping.txt";
     
     int num_tensors;
     Tensor *tensors = load_gpt2_model(model_file, &num_tensors);
@@ -1071,7 +1071,7 @@ int main(int argc, char **argv) {
     printf("Input tokenized to %d tokens\n", seq_len);
     
     // Generate 10 new tokens using cache
-    generate_text_with_cache(tensors, num_tensors, token_ids, seq_len, 10, token_mapping, num_token_entries);
+    generate_text_with_cache(tensors, num_tensors, token_ids, seq_len, max_tokens, token_mapping, num_token_entries);
     
     // Clean up
     free(token_ids);

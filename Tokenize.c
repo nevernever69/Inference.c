@@ -2,8 +2,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
-#include "cJSON.h"
-#include "Tokenize.h"
+#include "include/cJSON.h"
+#include "include/Tokenize.h"
+#include "include/uthash.h"
 
 #define MAX_TOKEN_LEN 128
 
@@ -134,8 +135,8 @@ char **bpe_encode(const char *word, int *out_len) {
 }
 
 int *tokenize(const char *input, int *out_len) {
-    load_vocab("vocab.json");
-    load_merges("merges.txt");
+    load_vocab("Model/vocab.json");
+    load_merges("Model/merges.txt");
     char *s = strdup(input);
     if (!s) { fprintf(stderr, "Memory allocation failed\n"); exit(1); }
     char *word = strtok(s, " \t\n");
